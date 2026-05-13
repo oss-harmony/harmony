@@ -153,14 +153,12 @@ impl Encoding {
                     &self.pattern(),
                 )
             }
-            _ => {
-                load_encoding_from_file(
-                    vocab_file_path,
-                    check_hash.then(|| self.expected_hash()),
-                    self.special_tokens().iter().cloned(),
-                    &self.pattern(),
-                )
-            }
+            _ => load_encoding_from_file(
+                vocab_file_path,
+                check_hash.then(|| self.expected_hash()),
+                self.special_tokens().iter().cloned(),
+                &self.pattern(),
+            ),
         }
     }
 
