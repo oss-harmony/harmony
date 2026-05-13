@@ -15,6 +15,3 @@ pub mod tests;
 
 #[cfg(feature = "python-binding")]
 mod py_module;
-
-#[cfg(feature = "wasm-binding")]
-mod wasm_module;
