@@ -1,15 +1,8 @@
-use std::{
-    collections::HashMap,
-    fs::File,
-    io::{BufReader, BufWriter, Read as _, Write as _},
-    path::{Path, PathBuf},
-    sync::OnceLock,
-};
+use std::{collections::HashMap, io::Cursor, path::PathBuf};
 
 use base64::{prelude::BASE64_STANDARD, Engine as _};
 
 use crate::tiktoken::{CoreBPE, Rank};
-use sha1::Sha1;
 use sha2::{Digest as _, Sha256};
 
 #[derive(Debug, thiserror::Error)]
@@ -25,53 +18,15 @@ pub enum LoadError {
 
     #[error("failed to create CoreBPE: {0}")]
     CoreBPECreationFailed(#[source] Box<dyn std::error::Error + Send + Sync>),
-
-    #[error("error downloading or loading vocab file: {0}")]
-    DownloadOrLoadVocabFile(
-        #[source]
-        #[from]
-        RemoteVocabFileError,
-    ),
-
-    #[error("failed to extend encoding")]
-    FailedToExtendEncoding(#[source] Box<dyn std::error::Error + Send + Sync>),
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum RemoteVocabFileError {
-    #[error("failed to download or load vocab file")]
-    FailedToDownloadOrLoadVocabFile(#[source] Box<dyn std::error::Error + Send + Sync>),
-
-    #[error("an underlying IO error occurred while {0}: {1}")]
-    IOError(String, #[source] std::io::Error),
-
-    #[error("hash mismatch for remote file {file_url}")]
-    HashMismatch {
-        file_url: String,
-        expected_hash: String,
-        computed_hash: String,
-    },
 }
 
 const TIKTOKEN_ENCODINGS_BASE_VAR: &str = "TIKTOKEN_ENCODINGS_BASE";
-const DEFAULT_TIKTOKEN_BASE_URL: &str = "https://openaipublic.blob.core.windows.net/encodings/";
 
-static TIKTOKEN_BASE_URL_OVERRIDE: OnceLock<String> = OnceLock::new();
+const O200K_BASE_DATA: &[u8] = include_bytes!("data/o200k_base.tiktoken.zst");
+const CL100K_BASE_DATA: &[u8] = include_bytes!("data/cl100k_base.tiktoken.zst");
 
-pub fn set_tiktoken_base_url(base_url: impl Into<String>) {
-    let mut base = base_url.into();
-    if !base.ends_with('/') {
-        base.push('/');
-    }
-    // ignore error if already set
-    let _ = TIKTOKEN_BASE_URL_OVERRIDE.set(base);
-}
-
-fn tiktoken_base_url() -> &'static str {
-    TIKTOKEN_BASE_URL_OVERRIDE
-        .get()
-        .map(|s| s.as_str())
-        .unwrap_or(DEFAULT_TIKTOKEN_BASE_URL)
+fn decompress_vocab(compressed: &[u8]) -> Vec<u8> {
+    zstd::decode_all(Cursor::new(compressed)).expect("embedded vocab data is corrupt")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,80 +67,62 @@ impl Encoding {
     }
 
     pub fn load(&self) -> Result<CoreBPE, LoadError> {
-        let (vocab_file_path, check_hash) =
-            if let Ok(base_dir) = std::env::var(TIKTOKEN_ENCODINGS_BASE_VAR) {
-                (PathBuf::from(base_dir).join(self.vocab_file_name()), true)
-            } else {
-                let url = self.public_vocab_file_url();
-                (
-                    download_or_find_cached_file(&url, Some(self.expected_hash()))
-                        .map_err(LoadError::DownloadOrLoadVocabFile)?,
-                    false,
-                )
-            };
+        let encoder = if let Ok(base_dir) = std::env::var(TIKTOKEN_ENCODINGS_BASE_VAR) {
+            let path = PathBuf::from(base_dir).join(self.vocab_file_name());
+            load_tiktoken_vocab_file(&path, Some(self.expected_hash()))
+                .map_err(LoadError::InvalidTiktokenVocabFile)?
+        } else {
+            let raw = decompress_vocab(self.embedded_data());
+            load_tiktoken_vocab_bytes(&raw, None).map_err(LoadError::InvalidTiktokenVocabFile)?
+        };
 
-        match self {
-            Self::O200kHarmony => {
-                let mut specials: Vec<(String, Rank)> = self
-                    .special_tokens()
-                    .iter()
-                    .map(|(s, r)| ((*s).to_string(), *r))
-                    .collect();
-                specials.extend((200014..=201088).map(|id| (format!("<|reserved_{id}|>"), id)));
-                load_encoding_from_file(
-                    vocab_file_path,
-                    check_hash.then(|| self.expected_hash()),
-                    specials,
-                    &self.pattern(),
-                )
-            }
-            Self::O200kBase => {
-                let mut specials: Vec<(String, Rank)> = self
-                    .special_tokens()
-                    .iter()
-                    .map(|(s, r)| ((*s).to_string(), *r))
-                    .collect();
-                specials.extend((199998..=201088).map(|id| (format!("<|reserved_{id}|>"), id)));
-                load_encoding_from_file(
-                    vocab_file_path,
-                    check_hash.then(|| self.expected_hash()),
-                    specials,
-                    &self.pattern(),
-                )
-            }
-            _ => load_encoding_from_file(
-                vocab_file_path,
-                check_hash.then(|| self.expected_hash()),
-                self.special_tokens().iter().cloned(),
-                &self.pattern(),
-            ),
-        }
-    }
+        let specials = self.build_special_tokens();
 
-    fn public_vocab_file_url(&self) -> String {
-        let base = tiktoken_base_url();
-        match self {
-            Self::O200kBase => format!("{base}o200k_base.tiktoken"),
-            Self::O200kHarmony => format!("{base}o200k_base.tiktoken"),
-            Self::Cl100kBase => format!("{base}cl100k_base.tiktoken"),
-        }
+        CoreBPE::new(encoder, specials, &self.pattern()).map_err(LoadError::CoreBPECreationFailed)
     }
 
     fn vocab_file_name(&self) -> &'static str {
         match self {
-            Self::O200kBase => "o200k_base.tiktoken",
-            Self::O200kHarmony => "o200k_base.tiktoken",
+            Self::O200kBase | Self::O200kHarmony => "o200k_base.tiktoken",
             Self::Cl100kBase => "cl100k_base.tiktoken",
+        }
+    }
+
+    fn embedded_data(&self) -> &'static [u8] {
+        match self {
+            Self::O200kBase | Self::O200kHarmony => O200K_BASE_DATA,
+            Self::Cl100kBase => CL100K_BASE_DATA,
         }
     }
 
     fn expected_hash(&self) -> &'static str {
         match self {
-            Self::O200kBase => "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d",
-            Self::O200kHarmony => {
+            Self::O200kBase | Self::O200kHarmony => {
                 "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d"
             }
             Self::Cl100kBase => "223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b2a7",
+        }
+    }
+
+    fn build_special_tokens(&self) -> Vec<(String, Rank)> {
+        let base: Vec<(String, Rank)> = self
+            .special_tokens()
+            .iter()
+            .map(|(s, r)| ((*s).to_string(), *r))
+            .collect();
+
+        match self {
+            Self::O200kHarmony => {
+                let mut specials = base;
+                specials.extend((200014..=201088).map(|id| (format!("<|reserved_{id}|>"), id)));
+                specials
+            }
+            Self::O200kBase => {
+                let mut specials = base;
+                specials.extend((199998..=201088).map(|id| (format!("<|reserved_{id}|>"), id)));
+                specials
+            }
+            Self::Cl100kBase => base,
         }
     }
 
@@ -222,18 +159,7 @@ impl Encoding {
 
     fn pattern(&self) -> String {
         match self {
-            Self::O200kBase => {
-                [
-                    "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
-                    "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
-                    "\\p{N}{1,3}",
-                    " ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*",
-                    "\\s*[\\r\\n]+",
-                    "\\s+(?!\\S)",
-                    "\\s+",
-                ].join("|")
-            }
-            Self::O200kHarmony => {
+            Self::O200kBase | Self::O200kHarmony => {
                 [
                     "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
                     "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
@@ -260,7 +186,6 @@ where
 {
     let mut hasher = expected_hash.map(|_| Sha256::new());
     let mut bpe_ranks = HashMap::new();
-    // using readline here so that the line returned includes the newline bytes for the hasher
     let mut lin_no = 0;
     let mut line_buffer = String::new();
     while reader.read_line(&mut line_buffer)? > 0 {
@@ -308,134 +233,19 @@ pub fn load_tiktoken_vocab_file<P>(
     expected_hash: Option<&str>,
 ) -> std::result::Result<HashMap<Vec<u8>, Rank>, std::io::Error>
 where
-    P: AsRef<Path>,
+    P: AsRef<std::path::Path>,
 {
     let file = std::fs::File::open(path)?;
     let reader = std::io::BufReader::new(file);
     load_tiktoken_vocab(reader, expected_hash)
 }
 
-pub fn load_encoding_from_file<P, S, TS>(
-    file_path: P,
+fn load_tiktoken_vocab_bytes(
+    data: &[u8],
     expected_hash: Option<&str>,
-    special_tokens: S,
-    pattern: &str,
-) -> Result<CoreBPE, LoadError>
-where
-    P: AsRef<Path>,
-    S: IntoIterator<Item = (TS, Rank)>,
-    TS: Into<String>,
-{
-    let encoder = load_tiktoken_vocab_file(file_path, expected_hash)
-        .map_err(LoadError::InvalidTiktokenVocabFile)?;
-    CoreBPE::new(
-        encoder,
-        special_tokens.into_iter().map(|(k, v)| (k.into(), v)),
-        pattern,
-    )
-    .map_err(LoadError::CoreBPECreationFailed)
-}
-
-/// This returns the path to a file containing the data at `url`. If the file is
-/// cached, it is used. Otherwise, the file is downloaded and cached.
-fn download_or_find_cached_file(
-    url: &str,
-    expected_hash: Option<&str>,
-) -> Result<PathBuf, RemoteVocabFileError> {
-    let cache_dir = resolve_cache_dir()?;
-    let cache_path = resolve_cache_path(&cache_dir, url);
-    if cache_path.exists() {
-        if verify_file_hash(&cache_path, expected_hash)? {
-            return Ok(cache_path);
-        }
-        let _ = std::fs::remove_file(&cache_path);
-    }
-    let hash = load_remote_file(url, &cache_path)?;
-    if let Some(expected_hash) = expected_hash {
-        if hash != expected_hash {
-            let _ = std::fs::remove_file(&cache_path);
-            return Err(RemoteVocabFileError::HashMismatch {
-                file_url: url.to_string(),
-                expected_hash: expected_hash.to_string(),
-                computed_hash: hash,
-            });
-        }
-    }
-    Ok(cache_path)
-}
-
-fn resolve_cache_dir() -> Result<PathBuf, RemoteVocabFileError> {
-    // we use a different env var and a different default dir name to avoid
-    // conflicts with the python tiktoken package, while sharing a cache dir
-    // with the python tiktoken package is a desirable future goal, it is not
-    // a priority and we should optimize for avoiding breaking tiktoken installs
-    // on the same system until we can validate the correctness wrt the python
-    // implementation and write tests to avoid regressions
-    let cache_dir_override = std::env::var("TIKTOKEN_RS_CACHE_DIR").ok();
-    if let Some(cache_dir_override) = cache_dir_override {
-        Ok(PathBuf::from(cache_dir_override))
-    } else {
-        let cache_dir = std::env::temp_dir().join("tiktoken-rs-cache");
-        std::fs::create_dir_all(&cache_dir).map_err(|e| {
-            RemoteVocabFileError::IOError(format!("creating cache dir {cache_dir:?}"), e)
-        })?;
-        Ok(cache_dir)
-    }
-}
-
-fn resolve_cache_path(cache_dir: &Path, url: &str) -> PathBuf {
-    let mut hasher = Sha1::new();
-    hasher.update(url.as_bytes());
-    let cache_key = format!("{:x}", hasher.finalize());
-    cache_dir.join(cache_key)
-}
-
-fn verify_file_hash(
-    file_path: &Path,
-    expected_hash: Option<&str>,
-) -> Result<bool, RemoteVocabFileError> {
-    let Some(expected_hash) = expected_hash else {
-        return Ok(true);
-    };
-    let file = File::open(file_path)
-        .map_err(|e| RemoteVocabFileError::IOError(format!("opening file {file_path:?}"), e))?;
-    let mut reader = BufReader::new(file);
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut reader, &mut hasher).map_err(|e| {
-        RemoteVocabFileError::IOError(format!("copying file {file_path:?} contents to hasher"), e)
-    })?;
-    let computed_hash = format!("{:x}", hasher.finalize());
-    Ok(computed_hash == expected_hash)
-}
-
-/// Loads a remote file to `destination` and returns the computed hash of the
-/// file contents.
-fn load_remote_file(url: &str, destination: &Path) -> Result<String, RemoteVocabFileError> {
-    let client = reqwest::blocking::Client::new();
-    let mut response = client
-        .get(url)
-        .send()
-        .and_then(|r| r.error_for_status())
-        .map_err(|e| RemoteVocabFileError::FailedToDownloadOrLoadVocabFile(Box::new(e)))?;
-
-    let file = File::create(destination)
-        .map_err(|e| RemoteVocabFileError::IOError(format!("creating file {destination:?}"), e))?;
-    let mut dest = BufWriter::new(file);
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 8192];
-    loop {
-        let bytes_read = response.read(&mut buffer).map_err(|e| {
-            RemoteVocabFileError::IOError(format!("reading from response {url}"), e)
-        })?;
-        if bytes_read == 0 {
-            break;
-        }
-        dest.write_all(&buffer[..bytes_read]).map_err(|e| {
-            RemoteVocabFileError::IOError(format!("writing to file {destination:?}"), e)
-        })?;
-        hasher.update(&buffer[..bytes_read]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
+) -> std::result::Result<HashMap<Vec<u8>, Rank>, std::io::Error> {
+    let reader = std::io::BufReader::new(Cursor::new(data));
+    load_tiktoken_vocab(reader, expected_hash)
 }
 
 #[cfg(test)]
@@ -446,6 +256,15 @@ mod tests {
     fn test_load_encodings() {
         for encoding in Encoding::all() {
             let _ = encoding.load().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_embedded_data_integrity() {
+        for encoding in &[Encoding::O200kBase, Encoding::Cl100kBase] {
+            let raw = decompress_vocab(encoding.embedded_data());
+            let hash = format!("{:x}", Sha256::digest(&raw));
+            assert_eq!(hash, encoding.expected_hash());
         }
     }
 }
