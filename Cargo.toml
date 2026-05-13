@@ -13,7 +13,6 @@ crate-type = ["rlib", "cdylib"]
 [features]
 default = []
 python-binding = ["pyo3"]
-wasm-binding = ["wasm-bindgen", "serde-wasm-bindgen", "wasm-bindgen-futures"]
 
 [dependencies]
 anyhow = "1.0.98"
@@ -46,11 +45,6 @@ pyo3 = { version = "0.25.0", optional = true, features = [
     "extension-module",
     "abi3-py38",
 ] }
-wasm-bindgen = { version = "0.2.100", optional = true, features = [
-    "serde-serialize",
-] }
-serde-wasm-bindgen = { version = "0.6.5", optional = true }
-wasm-bindgen-futures = { version = "0.4.42", optional = true }
 
 [dev-dependencies]
 pretty_assertions = "1.4.1"
