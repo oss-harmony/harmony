@@ -10,6 +10,15 @@ Install the package from PyPI:
 pip install oss-harmony
 ```
 
+> **Note:** `oss-harmony` and `openai-harmony` both provide the `openai_harmony` Python
+> module. Do not install both packages in the same environment — pip will silently
+> overwrite one with the other. If you are switching between packages, uninstall the
+> existing one first:
+>
+> ```bash
+> pip uninstall openai-harmony && pip install oss-harmony
+> ```
+
 Typical imports look like:
 
 ```python
