@@ -1438,9 +1438,8 @@ impl StreamableParser {
 
         let mut recipient: Option<String> = None;
         let mut content_type: Option<String> = None;
-        let remaining_content: Option<String>;
 
-        if parse_recipient_and_type && !parts.is_empty() {
+        let remaining_content: Option<String> = if parse_recipient_and_type && !parts.is_empty() {
             let num_parts = parts.len();
             // SAFETY: we know that there is at least one part remaining, because of is_empty check above
             let last_part = parts.pop().unwrap();
@@ -1467,19 +1466,19 @@ impl StreamableParser {
             }
 
             // Any remaining parts are content (not header metadata)
-            remaining_content = if !parts.is_empty() {
+            if !parts.is_empty() {
                 Some(parts.join(" "))
             } else {
                 None
-            };
+            }
         } else {
             // Treat all remaining parts as content when not parsing recipient and content type
-            remaining_content = if !parts.is_empty() {
+            if !parts.is_empty() {
                 Some(parts.join(" "))
             } else {
                 None
-            };
-        }
+            }
+        };
 
         let author = if role == Role::Tool {
             let name = role_str_opt;
