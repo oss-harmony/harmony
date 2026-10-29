@@ -1244,3 +1244,42 @@ def test_streamable_parser_tricky_utf8_decoding():
 
     # Ensure if we're accumulating content deltas we still get the full utf-8 text
     assert "".join(content_deltas) == tricky_utf8_text
+
+
+def _rendered_signature(parameters):
+    encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+    tool = ToolDescription.new("ping", "Ping the server.", parameters=parameters)
+    dev = DeveloperContent.new().with_function_tools([tool])
+    convo = Conversation.from_messages([Message.from_role_and_content(Role.DEVELOPER, dev)])
+    tokens = encoding.render_conversation_for_completion(convo, Role.ASSISTANT)
+    text = encoding.decode_utf8(tokens)
+    return next(line for line in text.splitlines() if line.startswith("type ping"))
+
+
+@pytest.mark.parametrize(
+    "parameters",
+    [
+        None,
+        {"type": "object", "properties": {}},
+        {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
+        {"type": "object", "properties": {}, "description": "Takes nothing."},
+    ],
+)
+def test_render_function_without_arguments(parameters):
+    # A schema that admits no argument renders like an absent one. Rendered as
+    # `(_: {}) => any`, the model invents a key for the argument it sees.
+    assert _rendered_signature(parameters) == "type ping = () => any;"
+
+
+@pytest.mark.parametrize(
+    "parameters",
+    [
+        {"type": "object", "properties": {"room": {"type": "string"}}, "required": ["room"]},
+        {"type": "object", "properties": {}, "additionalProperties": True},
+        {"type": "object", "properties": {}, "additionalProperties": {"type": "string"}},
+        {"type": "object", "properties": {}, "patternProperties": {"^x-": {"type": "string"}}},
+        {"type": "object", "anyOf": [{"required": ["a"]}, {"required": ["b"]}]},
+    ],
+)
+def test_render_function_admitting_arguments(parameters):
+    assert _rendered_signature(parameters).startswith("type ping = (_: ")
