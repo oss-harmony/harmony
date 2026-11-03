@@ -1015,3 +1015,64 @@ fn test_parse_completion_with_invalid_content_token_errors_on_eos() {
             .with_channel("analysis");
     assert_eq!(parsed_message, &expected_message);
 }
+
+fn rendered_signature(parameters: Option<serde_json::Value>) -> String {
+    let encoding = load_harmony_encoding(HarmonyEncodingName::HarmonyGptOss).unwrap();
+    let dev = DeveloperContent::new().with_function_tools(vec![ToolDescription::new(
+        "ping",
+        "Ping the server.",
+        parameters,
+    )]);
+    let convo = Conversation::from_messages([Message::from_role_and_content(Role::Developer, dev)]);
+    let tokens = encoding
+        .render_conversation_for_completion(&convo, Role::Assistant, None)
+        .unwrap();
+    let text = encoding.tokenizer().decode_utf8(&tokens).unwrap();
+    text.lines()
+        .find(|line| line.starts_with("type ping"))
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn test_render_function_without_arguments() {
+    // A schema that admits no argument renders like an absent one. Rendered as
+    // `(_: {}) => any`, the model invents a key for the argument it sees.
+    for parameters in [
+        None,
+        Some(json!({"type": "object", "properties": {}})),
+        Some(json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+        })),
+        Some(json!({"type": "object", "properties": {}, "description": "Takes nothing."})),
+    ] {
+        assert_eq!(
+            rendered_signature(parameters.clone()),
+            "type ping = () => any;",
+            "{parameters:?}"
+        );
+    }
+}
+
+#[test]
+fn test_render_function_admitting_arguments() {
+    for parameters in [
+        json!({
+            "type": "object",
+            "properties": {"room": {"type": "string"}},
+            "required": ["room"]
+        }),
+        json!({"type": "object", "properties": {}, "additionalProperties": true}),
+        json!({"type": "object", "properties": {}, "additionalProperties": {"type": "string"}}),
+        json!({"type": "object", "properties": {}, "patternProperties": {"^x-": {"type": "string"}}}),
+        json!({"type": "object", "anyOf": [{"required": ["a"]}, {"required": ["b"]}]}),
+    ] {
+        assert!(
+            rendered_signature(Some(parameters.clone())).starts_with("type ping = (_: "),
+            "{parameters:?}"
+        );
+    }
+}

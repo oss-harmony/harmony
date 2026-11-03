@@ -403,6 +403,40 @@ impl HarmonyEncoding {
         )
     }
 
+    /// Whether `schema` is an object schema that admits no argument: no properties, no
+    /// required names, no open or typed `additionalProperties`, and no other keyword
+    /// (`anyOf`, `$ref`, `patternProperties`, ...) that could admit one.
+    fn admits_no_argument(schema: &serde_json::Value) -> bool {
+        const ARGUMENT_FREE_KEYS: &[&str] = &[
+            "type",
+            "properties",
+            "required",
+            "additionalProperties",
+            "description",
+            "title",
+            "$schema",
+        ];
+        let Some(object) = schema.as_object() else {
+            return false;
+        };
+        let is_empty = |key: &str| match object.get(key) {
+            None => true,
+            Some(v) => {
+                v.as_object().is_some_and(|o| o.is_empty())
+                    || v.as_array().is_some_and(|a| a.is_empty())
+            }
+        };
+        object.get("type").and_then(|t| t.as_str()) == Some("object")
+            && is_empty("properties")
+            && is_empty("required")
+            && object
+                .get("additionalProperties")
+                .is_none_or(|v| v.as_bool() == Some(false))
+            && object
+                .keys()
+                .all(|k| ARGUMENT_FREE_KEYS.contains(&k.as_str()))
+    }
+
     /// Helper to convert a JSON schema (OpenAPI style) to a TypeScript type definition.
     fn json_schema_to_typescript(schema: &serde_json::Value, indent: &str) -> String {
         // Helper to check if this schema is an enum
@@ -776,14 +810,20 @@ impl HarmonyEncoding {
                     for line in tool.description.lines() {
                         tool_section_content.push(format!("// {line}"));
                     }
-                    if let Some(params) = &tool.parameters {
-                        let param_type = Self::json_schema_to_typescript(params, "");
-                        tool_section_content.push(format!(
-                            "type {} = (_: {}) => any;\n",
-                            tool.name, param_type
-                        ));
-                    } else {
-                        tool_section_content.push(format!("type {} = () => any;\n", tool.name));
+                    // A schema that admits no argument renders as taking none. Rendered as
+                    // `(_: {}) => any`, the model fills the argument it sees with an invented
+                    // key, which a caller's `additionalProperties: false` rejects.
+                    match &tool.parameters {
+                        Some(params) if !Self::admits_no_argument(params) => {
+                            let param_type = Self::json_schema_to_typescript(params, "");
+                            tool_section_content.push(format!(
+                                "type {} = (_: {}) => any;\n",
+                                tool.name, param_type
+                            ));
+                        }
+                        _ => {
+                            tool_section_content.push(format!("type {} = () => any;\n", tool.name));
+                        }
                     }
                 }
                 tool_section_content.push(format!("}} // namespace {}", ns_config.name));
